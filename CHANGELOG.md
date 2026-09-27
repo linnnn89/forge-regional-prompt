@@ -1,3 +1,10 @@
+### 2026-09-27 — 保守使用基线
+
+- 暂停后端改造和效果测试，冻结 `b5df75f` 的功能代码。
+- 原注意力作为日常路径，三个实验开关维持默认关闭；不强制覆盖个人配置。
+- README 明确适用范围、默认设置与恢复方法；docs/EXPERIMENTS.md 保存 A–H 对照参数、提示词、结果和局限。
+- 本次仅更新文档，不改变 UI 参数、生成逻辑或依赖；没有重新运行测试或生图。非等比人物占位与自然互动仍未可靠解决。
+
 ### Forge Regional Prompt — 2026 September 27
 
 - Start independent maintenance from Forge Couple v7.1.0 with a fresh Git history.
