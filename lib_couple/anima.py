@@ -142,6 +142,31 @@ class AttentionCoupleAnima:
                     stats["region_blends"] += 1
                     if stats["region_blends"] == 1:
                         logger.info(f"[Activity] anima_first_region_blend p={stats.get('request_id')} conditions={num_conds - 1} sequence_length={seq_len}")
+                        # Temporary diagnostic: inspect the actual blend weights once,
+                        # without recording prompts or changing the sampling tensors.
+                        grid_h = height // (8 * dit.patch_spatial)
+                        grid_w = width // (8 * dit.patch_spatial)
+                        geometry = {}
+                        for stage, values in (
+                            ("input", mask),
+                            ("attention", mask_downsample.reshape(num_conds, -1, grid_h, grid_w)),
+                        ):
+                            planes = values.detach().float().cpu().flatten(1, -3).mean(dim=1)
+                            entries = []
+                            for condition, plane in enumerate(planes[1:], start=1):
+                                active = plane > 1e-6
+                                ys, xs = active.nonzero(as_tuple=True)
+                                h, w = plane.shape
+                                bbox = ([round(xs.min().item() / w, 4),
+                                         round(ys.min().item() / h, 4),
+                                         round((xs.max().item() + 1) / w, 4),
+                                         round((ys.max().item() + 1) / h, 4)] if xs.numel() else None)
+                                entries.append(dict(condition=condition, bbox_xyxy=bbox,
+                                                    coverage_percent=round(active.float().mean().item() * 100, 3),
+                                                    mean_weight_percent=round(plane.mean().item() * 100, 3)))
+                            geometry[stage] = entries
+                        stats["mask_geometry"] = geometry
+                        logger.info(f"[MaskGeometry] p={stats.get('request_id')} hires={stats.get('hires')} grid={grid_w}x{grid_h} {geometry}")
                     pos += num_conds * batch_size
 
             return torch.cat(outputs, dim=0)
