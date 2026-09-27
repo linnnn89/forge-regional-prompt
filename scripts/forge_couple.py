@@ -1,0 +1,396 @@
+import re
+from json import dumps
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from modules.processing import StableDiffusionProcessing as P
+
+from lib_couple import settings  # noqa
+from lib_couple.attention_couple import AttentionCouple
+from lib_couple.gr_version import js
+from lib_couple.logging import logger
+from lib_couple.mapping import (
+    advanced_mapping,
+    basic_mapping,
+    empty_tensor,
+    mask_mapping,
+)
+from lib_couple.tile_funcs import calculate_tiles
+from lib_couple.ui import couple_ui
+from lib_couple.ui_funcs import validate_mapping
+
+try:
+    from lib_couple.anima import AttentionCoupleAnima
+except ImportError:
+    is_neo = False
+else:
+    is_neo = True
+
+from modules import scripts, shared
+
+VERSION = "7.1.0"
+
+UI_CACHES: dict[bool, tuple[list, Callable]] = {}
+
+
+class ForgeCouple(scripts.Script):
+
+    def __init__(self):
+        self.is_img2img: bool
+        self.couples: list
+        self.get_mask: Callable
+        self.is_hr: bool
+
+        self.valid: bool
+        """
+        Since raising error within Extensions does NOT cancel the generation,
+        the only way is to forcefully interrupt during generation...
+        """
+
+        self.tile_idx: int
+        self.tiles: list[str] = []
+
+    def title(self):
+        return "Forge Couple"
+
+    def show(self, is_img2img):
+        return scripts.AlwaysVisible
+
+    def ui(self, is_img2img):
+        self.is_img2img = is_img2img
+        diagnostic_cache_hit = is_img2img in UI_CACHES
+        if is_img2img in UI_CACHES:
+            comps, func = UI_CACHES[is_img2img]
+        else:
+            comps, func = couple_ui(self, is_img2img, f"{self.title()} v{VERSION}")
+            UI_CACHES[is_img2img] = (comps, func)
+        self.get_mask = func
+        self._debug("couple_ui_return", returned_components_len=len(comps), component_types=[type(c).__name__ for c in comps], cache_hit=diagnostic_cache_hit)
+        return comps
+
+    def after_component(self, component, **kwargs):
+        if (elem_id := kwargs.get("elem_id", None)) is not None:
+            if elem_id in ("txt2img_width", "txt2img_height"):
+                component.change(None, **js('() => { ForgeCouple.preview("t2i"); }'))
+            elif elem_id in ("img2img_width", "img2img_height"):
+                component.change(None, **js('() => { ForgeCouple.preview("i2i"); }'))
+
+    def _debug(self, event, **details):
+        # The host hook exists only in diagnostic builds of Forge.
+        hook = getattr(scripts, "_fc_debug", None)
+        if callable(hook):
+            hook(event, self, **details)
+
+    def _activity(self, event, p, **details):
+        # Temporary execution diagnostics; do not include prompt text.
+        logger.info(f"[Activity] {event} p={hex(id(p))} {dumps(details, ensure_ascii=False)}")
+        self._debug("activity_" + event, p_id=hex(id(p)), **details)
+
+    def postprocess(self, p, processed, *args):
+        for stats in getattr(self, "_activity_anima_runs", []):
+            self._activity("anima_summary", p, **stats)
+
+    def setup(self, p, *args, **kwargs):
+        self._activity_anima_runs = []
+        self.is_hr = False
+        if not self.is_img2img or getattr(shared.opts, "fc_no_tile", False):
+            return
+
+        if calculate_tiles(self, (p, *args)) is None:
+            self.invalidate(p)
+
+        self.tile_idx = -1
+
+    def before_process(self, p, *args, **kwargs):
+        if not self.tiles:
+            return
+
+        self.tile_idx += 1
+        p.prompt = self.tiles[self.tile_idx]
+        debug: bool = args[-1]
+
+        if debug:
+            print("")
+            logger.info(f"[Tile Debug]\n{p.prompt}\n")
+
+    def before_hr(self, p: "P", *args, **kwargs):
+        self.is_hr = True
+        if is_neo and p.sd_model.model_config.huggingface_repo.endswith("Anima"):
+            AttentionCoupleAnima.unpatch()
+
+    def _is_tile(self) -> bool:
+        return self.is_img2img and len(self.tiles) > 0
+
+    @staticmethod
+    def parse_common_prompt(
+        prompt: str,
+        brackets: tuple[str],
+        def_in_prompt: bool,
+    ) -> str:
+        common_prompts: dict[str, str] = {}
+        op, cs = brackets
+
+        pattern = rf"{op}([^{op}{cs}]+?):([^{op}{cs}]+?){cs}"
+        matches = list(re.finditer(pattern, prompt))
+        for m in matches:
+            key: str = m.group(1).strip()
+            val: str = m.group(2).strip()
+            prompt = prompt.replace(m.group(0), val if def_in_prompt else "")
+            common_prompts.update({key: val})
+
+        pattern = rf"{op}([^{op}{cs}]+?){cs}"
+        matches = list(re.finditer(pattern, prompt))
+        for m in matches:
+            key: str = m.group(1).strip()
+            if key in common_prompts:
+                prompt = prompt.replace(m.group(0), common_prompts[key])
+
+        return prompt
+
+    def invalidate(self, p):
+        self._activity("invalidated", p)
+        self.valid = False
+        p.extra_generation_params.update({"forge_couple": "ERROR"})
+        if shared.opts.fc_do_interrupt:
+            shared.state.interrupt()
+
+    def after_extra_networks_activate(
+        self,
+        p: "P",
+        enable: bool,
+        disable_hr: bool,
+        mode: str,
+        separator: str,
+        direction: str,
+        background: str,
+        background_weight: float,
+        mapping: list,
+        common_parser: str,
+        common_debug: bool,
+        def_in_prompt: bool,
+        *args,
+        **kwargs,
+    ):
+        self.couples = None
+        if not enable:
+            self._activity("parse_skipped", p, reason="disabled")
+            return
+
+        if self._is_tile():
+            self._activity("skipped", p, reason="tile_mode")
+            return
+
+        separator = separator.replace("\\n", "\n").replace("\\t", " ")
+        if not separator.strip():
+            separator = "\n"
+
+        prompts: str = kwargs["prompts"][0]
+
+        if common_parser in ("{ }", "< >"):
+            prompts = self.parse_common_prompt(
+                prompts,
+                common_parser.split(" "),
+                def_in_prompt,
+            )
+            if common_debug:
+                print("")
+                logger.info(f"[Common Prompts Debug]\n{prompts}\n")
+
+        couples: list[str] = [chunk.strip() for chunk in prompts.split(separator)]
+        self._activity("parsed", p, mode=mode, separator=repr(separator),
+                       prompt_parts=len(couples), empty_parts=sum(not c for c in couples),
+                       regions=len(couples) - int(background != "None") if mode == "Basic" else len(mapping or []),
+                       background=background, background_weight=background_weight, direction=direction)
+
+        match mode:
+            case "Basic":
+                if len(couples) < (3 - int(background == "None")):
+                    ratio = f"{len(couples)} / {3 - int(background == 'None')}"
+                    logger.error(f"Not Enough Lines in Prompt... [{ratio}]")
+                    self.invalidate(p)
+                    return
+
+            case "Mask":
+                mapping: list = self.get_mask() or mapping
+                if not mapping:
+                    logger.error("No regions configured. Apply a template or save a region before generating.")
+                    self.invalidate(p)
+                    return
+
+                if not all(isinstance(item, dict) for item in mapping):
+                    logger.error("Invalid region mapping format for Mask mode.")
+                    self.invalidate(p)
+                    return
+
+                required: int = len(mapping) + int(background != "None")
+                if len(couples) != required:
+                    ratio = f"{len(couples)} / {required}"
+                    logger.error(f"Number of Couples and Masks mismatched... [{ratio}]")
+                    self.invalidate(p)
+                    return
+
+            case "Advanced":
+                if not mapping:
+                    logger.error("No regions configured. Apply a template or save a region before generating.")
+                    self.invalidate(p)
+                    return
+
+                if not all(isinstance(item, list) for item in mapping):
+                    logger.error("Invalid region mapping format for Advanced mode.")
+                    self.invalidate(p)
+                    return
+
+                if not validate_mapping(mapping, True):
+                    self.invalidate(p)
+                    return
+
+                if len(couples) != len(mapping):
+                    ratio = f"{len(couples)} / {len(mapping)}"
+                    logger.error(f"Number of Couples and Masks mismatched... [{ratio}]")
+                    self.invalidate(p)
+                    return
+
+        # ===== Infotext =====
+        fc_param: dict = {}
+
+        fc_param["forge_couple"] = True
+        fc_param["forge_couple_compatibility"] = disable_hr
+        fc_param["forge_couple_mode"] = mode
+        if mode == "Mask":
+            mask_data = self.get_mask.__self__
+            fc_param["forge_couple_mask_overlap"] = mask_data.overlap
+            fc_param["forge_couple_mask_feather"] = mask_data.feather
+            self._activity("mask_effects", p, layers=len(mapping),
+                           overlap_percent=mask_data.overlap, feather_percent=mask_data.feather,
+                           disable_in_hires=disable_hr)
+        fc_param["forge_couple_separator"] = separator.replace("\n", "\\n")
+        if mode == "Basic":
+            fc_param["forge_couple_direction"] = direction
+        if mode == "Advanced":
+            fc_param["forge_couple_mapping"] = dumps(mapping)
+        else:
+            fc_param["forge_couple_background"] = background
+            fc_param["forge_couple_background_weight"] = background_weight
+        fc_param["forge_couple_common_parser"] = common_parser
+        fc_param["forge_couple_def_in_prompt"] = def_in_prompt
+
+        p.extra_generation_params.update(fc_param)
+        # ===== Infotext =====
+
+        self.couples = couples
+        self.valid = True
+        self._activity("validated", p, prompt_parts=len(couples))
+
+    def before_process_batch(self, p: "P", *args, **kwargs):
+        if is_neo and p.sd_model.model_config.huggingface_repo.endswith("Anima"):
+            AttentionCoupleAnima.unpatch()
+
+    def process_before_every_sampling(
+        self,
+        p: "P",
+        enable: bool,
+        disable_hr: bool,
+        mode: str,
+        separator: str,
+        direction: str,
+        background: str,
+        background_weight: float,
+        mapping: list,
+        *args,
+        **kwargs,
+    ):
+        if (not enable) or (self.couples is None) or (not self.valid):
+            self._activity("sampling_skipped", p, reason="disabled" if not enable else "no_parsed_couples" if self.couples is None else "invalid")
+            return
+
+        if self._is_tile():
+            self._activity("skipped", p, reason="tile_mode")
+            return
+
+        if disable_hr and self.is_hr:
+            self._activity("sampling_skipped", p, reason="compatibility_hires")
+            return
+
+        if getattr(p, "_ad_inner", False):
+            self._activity("sampling_skipped", p, reason="adetailer_inner")
+            return
+
+        # ===== Init =====
+        WIDTH: int = p.hr_upscale_to_x if self.is_hr else p.width
+        HEIGHT: int = p.hr_upscale_to_y if self.is_hr else p.height
+        IS_HORIZONTAL: bool = direction == "Horizontal"
+        NO_BACKGROUND: bool = background == "None"
+
+        LINE_COUNT: int = len(self.couples)
+
+        if mode != "Advanced":
+            BG_WEIGHT: float = 0.0 if NO_BACKGROUND else max(0.1, background_weight)
+
+        if mode == "Basic":
+            TILE_COUNT: int = LINE_COUNT - int(not NO_BACKGROUND)
+            TILE_WEIGHT: float = 1.25 if NO_BACKGROUND else 1.0
+            TILE_SIZE: int = (
+                (WIDTH if IS_HORIZONTAL else HEIGHT) - 1
+            ) // TILE_COUNT + 1
+        # ===== Init =====
+
+        # ===== Tiles =====
+        match mode:
+            case "Basic":
+                fc_args = basic_mapping(
+                    p.sd_model,
+                    self.couples,
+                    WIDTH,
+                    HEIGHT,
+                    LINE_COUNT,
+                    IS_HORIZONTAL,
+                    background,
+                    TILE_SIZE,
+                    TILE_WEIGHT,
+                    BG_WEIGHT,
+                )
+
+            case "Mask":
+                mapping: list[dict] = self.get_mask() or mapping
+
+                fc_args = mask_mapping(
+                    p.sd_model,
+                    self.couples,
+                    WIDTH,
+                    HEIGHT,
+                    LINE_COUNT,
+                    mapping,
+                    background,
+                    BG_WEIGHT,
+                )
+
+            case "Advanced":
+                fc_args = advanced_mapping(
+                    p.sd_model, self.couples, WIDTH, HEIGHT, mapping
+                )
+        # ===== Tiles =====
+
+        assert len(fc_args.keys()) // 2 == LINE_COUNT
+
+        unet = p.sd_model.forge_objects.unet
+        base_mask = empty_tensor(HEIGHT, WIDTH)
+
+        if is_neo and p.sd_model.model_config.huggingface_repo.endswith("Anima"):
+            patched_unet = AttentionCoupleAnima.patch_dit(
+                unet, base_mask, WIDTH, HEIGHT, fc_args
+            )
+            if patched_unet is not None:
+                stats = AttentionCoupleAnima._activity_stats
+                stats["request_id"] = hex(id(p))
+                stats["hires"] = self.is_hr
+                self._activity_anima_runs.append(stats)
+        else:
+            patched_unet = AttentionCouple.patch_unet(unet, base_mask, fc_args)
+
+        if patched_unet is None:
+            self.invalidate(p)
+        else:
+            p.sd_model.forge_objects.unet = patched_unet
+            self._activity("patch_installed", p,
+                           backend="Anima" if is_neo and p.sd_model.model_config.huggingface_repo.endswith("Anima") else "UNet",
+                           conditions=len(fc_args) // 2, width=WIDTH, height=HEIGHT, hires=self.is_hr)

@@ -1,0 +1,7 @@
+__pycache__
+*.json
+*.pyc
+*.log
+.env
+.env.*
+.github/FUNDING.yml
