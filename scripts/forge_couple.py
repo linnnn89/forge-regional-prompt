@@ -89,9 +89,14 @@ class ForgeCouple(scripts.Script):
     def postprocess(self, p, processed, *args):
         for stats in getattr(self, "_activity_anima_runs", []):
             self._activity("anima_summary", p, **stats)
+        for stats in getattr(self, "_activity_denoise_runs", []):
+            self._activity("regional_denoise_summary", p, **stats)
+        if any(s.get("backend") == "joint_attention" for s in getattr(self, "_activity_anima_runs", [])):
+            AttentionCoupleAnima.unpatch()
 
     def setup(self, p, *args, **kwargs):
         self._activity_anima_runs = []
+        self._activity_denoise_runs = []
         self.is_hr = False
         if not self.is_img2img or getattr(shared.opts, "fc_no_tile", False):
             return
@@ -197,6 +202,13 @@ class ForgeCouple(scripts.Script):
                 logger.info(f"[Common Prompts Debug]\n{prompts}\n")
 
         couples: list[str] = [chunk.strip() for chunk in prompts.split(separator)]
+        if (mode == "Mask" and is_neo
+                and p.sd_model.model_config.huggingface_repo.endswith("Anima")
+                and getattr(shared.opts, "fc_anima_joint_attention", False)
+                and background == "None"):
+            logger.error("Joint attention requires a First Line or Last Line global prompt describing the whole scene.")
+            self.invalidate(p)
+            return
         self._activity("parsed", p, mode=mode, separator=repr(separator),
                        prompt_parts=len(couples), empty_parts=sum(not c for c in couples),
                        regions=len(couples) - int(background != "None") if mode == "Basic" else len(mapping or []),
@@ -374,8 +386,46 @@ class ForgeCouple(scripts.Script):
 
         unet = p.sd_model.forge_objects.unet
         base_mask = empty_tensor(HEIGHT, WIDTH)
+        is_anima = is_neo and p.sd_model.model_config.huggingface_repo.endswith("Anima")
+        use_joint = mode == "Mask" and is_anima and getattr(shared.opts, "fc_anima_joint_attention", False)
+        use_denoise = mode == "Mask" and is_anima and not use_joint and getattr(shared.opts, "fc_mask_regional_denoise", False)
 
-        if is_neo and p.sd_model.model_config.huggingface_repo.endswith("Anima"):
+        if use_joint:
+            from lib_couple.joint_attention import JointAttentionAnima
+            penalty = float(getattr(shared.opts, "fc_joint_spatial_penalty", 4.0))
+            patched_unet, stats = JointAttentionAnima.patch_dit(unet, WIDTH, HEIGHT, fc_args, penalty)
+            stats.update(request_id=hex(id(p)), hires=self.is_hr)
+            self._activity_anima_runs.append(stats)
+            p.extra_generation_params["forge_couple_backend"] = "joint_attention"
+            p.extra_generation_params["forge_couple_joint_spatial_penalty"] = penalty
+        elif use_denoise:
+            from lib_couple.regional_denoise import RegionalDenoise
+            from lib_couple.mapping import text2cond
+            from modules.prompt_parser import SdConditioning
+            AttentionCoupleAnima.unpatch()
+            denoise_options = dict(
+                scene_weight=float(getattr(shared.opts, "fc_denoise_scene_weight", 0.25)),
+                fade_start=float(getattr(shared.opts, "fc_denoise_fade_start", 0.5)),
+                region_end=float(getattr(shared.opts, "fc_denoise_region_end", 0.85)),
+                local_prediction=bool(getattr(shared.opts, "fc_denoise_local_prediction", False)),
+                context_percent=float(getattr(shared.opts, "fc_denoise_context_percent", 5.0)),
+            )
+            if denoise_options["local_prediction"]:
+                from backend.args import dynamic_args
+                if getattr(dynamic_args, "ref_latents", []):
+                    raise ValueError("Local regional predictions do not support reference-image latents.")
+            # Reuse parsed text so custom separators and Common Prompts macros
+            # cannot leak into the whole-scene branch as literal syntax.
+            scene_context = None
+            if denoise_options["scene_weight"] > 0 or denoise_options["region_end"] < 1 or denoise_options["fade_start"] < 1:
+                scene_context = text2cond(p.sd_model, SdConditioning(
+                    [", ".join(self.couples)], False, WIDTH, HEIGHT, None))[0]
+            patched_unet, stats = RegionalDenoise.patch(unet, fc_args, scene_context=scene_context, **denoise_options)
+            stats.update(request_id=hex(id(p)), hires=self.is_hr)
+            self._activity_denoise_runs.append(stats)
+            p.extra_generation_params["forge_couple_backend"] = "regional_denoise"
+            p.extra_generation_params.update({f"forge_couple_denoise_{k}": v for k, v in denoise_options.items()})
+        elif is_anima:
             patched_unet = AttentionCoupleAnima.patch_dit(
                 unet, base_mask, WIDTH, HEIGHT, fc_args
             )
@@ -392,5 +442,5 @@ class ForgeCouple(scripts.Script):
         else:
             p.sd_model.forge_objects.unet = patched_unet
             self._activity("patch_installed", p,
-                           backend="Anima" if is_neo and p.sd_model.model_config.huggingface_repo.endswith("Anima") else "UNet",
+                           backend="Anima joint attention" if use_joint else "Anima regional denoise" if use_denoise else "Anima" if is_anima else "UNet",
                            conditions=len(fc_args) // 2, width=WIDTH, height=HEIGHT, hires=self.is_hr)
